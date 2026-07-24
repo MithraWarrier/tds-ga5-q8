@@ -59,14 +59,30 @@ def is_path_safe(requested_path: str) -> bool:
 
 
 def is_target_internal(val: str) -> bool:
-    """Smartly detects internal IPs without blocking benign weird strings."""
+    """Smartly detects internal IPs or SSRF targets in query parameters."""
     v = unquote(val).strip().lower()
     
-    # 1. Exact matches for common SSRF bypass strings
-    if "localhost" in v or "metadata" in v or "169.254" in v:
-        return True
+    # 1. If the parameter is an embedded URL, parse and check the hostname
+    if v.startswith("http://") or v.startswith("https://"):
+        try:
+            parsed = urlparse(v)
+            hostname = parsed.hostname or ""
+            if hostname in ("localhost", "metadata"):
+                return True
+            try:
+                ip = ipaddress.ip_address(hostname)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return True
+            except ValueError:
+                pass
+        except Exception:
+            pass
 
-    # 2. Extract valid IPv4 addresses to prevent overblocking (e.g. 10.5 won't trigger)
+    # 2. If it's a direct exact match
+    if v in ("localhost", "metadata"):
+        return True
+        
+    # 3. Extract any valid IPv4 addresses to prevent blocking safe strings
     ip_pattern = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
     for ip_str in ip_pattern.findall(v):
         try:
@@ -88,6 +104,9 @@ def is_url_safe(raw_url: str) -> bool:
             return False
 
         hostname = (parsed.hostname or "").lower()
+        if hostname.endswith("."):
+            hostname = hostname[:-1]
+            
         if hostname not in ALLOWED_HOSTS:
             return False
 
@@ -122,20 +141,26 @@ async def execute_read_file(path_str: str) -> str:
 
 
 async def execute_fetch_url(url_str: str) -> str:
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        # Do not automatically follow to intercept and validate redirects safely
-        response = await client.get(url_str, follow_redirects=False)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        current_url = url_str
         
-        if response.status_code in (301, 302, 303, 307, 308):
-            # httpx builds the absolute URL for us, solving the relative-redirect issue
-            redirect_url = str(response.next_request.url)
+        # Follow up to 5 redirects manually to validate every step
+        for _ in range(5):
+            response = await client.get(current_url, follow_redirects=False)
             
-            if not is_url_safe(redirect_url):
-                raise PermissionError("Blocked redirect to disallowed host")
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    break
                 
-            # Follow to the safe target
-            response = await client.get(redirect_url, follow_redirects=True)
-            
+                # Accurately resolve relative redirect paths (e.g., /about)
+                current_url = str(response.url.join(location))
+                
+                if not is_url_safe(current_url):
+                    raise PermissionError(f"Blocked redirect to disallowed host: {current_url}")
+            else:
+                return response.text
+                
         return response.text
 
 
